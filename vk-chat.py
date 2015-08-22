@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 ##
 ## vk-chat.py for weechat
 ## by lenormf
@@ -11,7 +12,11 @@
 
 import re
 import time
+import json
+import socket
+import select
 import inspect
+
 import weechat
 
 ## FIXME: REMOVE
@@ -29,7 +34,7 @@ class Script:
     DESCRIPTION = "Chat with your friends on Vkontakte"
 
 class Util:
-    DEBUG = False
+    DEBUG = True
 
     @staticmethod
     def GetParentFunctionName():
@@ -69,14 +74,27 @@ class Util:
 
         weechat.config_set_plugin(option_name, option_value)
 
+class VkMessageFlag:
+    UNREAD = 1
+    OUTBOX = 2
+    REPLIED = 4
+    IMPORTANT = 8
+    CHAT = 16
+    FRIENDS = 32
+    SPAM = 64
+    DELETED = 128
+    FIXED = 256
+    MEDIA = 512
 
-class Plugin:
+class Plugin(object):
     DEFAULT_OPTIONS = [
         ("vk-token", ""),
         ("max-friends-suggestions", "10"),
     ]
 
     def __init__(self):
+        super(Plugin, self).__init__()
+
         self._timers = {}
         self._authed_vk = False
         self._vk_api = None
@@ -197,6 +215,9 @@ class Plugin:
         return True
 
     def GetUnreadMessages(self):
+        ## XXX: don't use this function
+        assert(False)
+
         try:
             ## XXX: the filters variable doesn't seem to be returning unread messages only
             messages = self._vk_api.messages.get(count=5, time_offset=0, filters=1, preview_length=0, out=0)
@@ -214,13 +235,29 @@ class Plugin:
 
         return messages
 
+    def GetLongPollServerInfo(self):
+        try:
+            info = self._vk_api.messages.getLongPollServer(use_ssl=0, need_pts=0)
+        except vkontakte.VKError as e:
+            Util.Log("VKError: unable to get longpoll server info")
+            Util.Debug(u"{0}".format(e))
+            return False
+        except Exception as e:
+            Util.Log("Unknown Exception: unable to get longpoll server info")
+            Util.Debug(u"{0}".format(e))
+            return False
+
+        Util.Debug("info about the longpoll server received: {0}".format(info))
+
+        return info
+
     def SetDefaultOptions(self):
         for k, v in self.DEFAULT_OPTIONS:
             option_value = Util.GetConfigOption(k)
             if not option_value:
                 Util.SetConfigOption(k, v)
             else:
-                Util.Debug("option {0} is already set to '{1}'".format(k, option_value))
+                Util.Debug(u"option {0} is already set to '{1}'".format(k, option_value))
 
     def SetCommands(self):
         weechat.hook_command("vkchat", "Chat with a friend on VK", "FIXME: document this command", "FIXME: document args", "FIXME: completion", "CallbackVkChat", "")
@@ -249,8 +286,149 @@ class Plugin:
 
 plugin = Plugin()
 
+class UpdatesPoller(object):
+    def __init__(self):
+        super(UpdatesPoller, self).__init__()
+
+        self._sock = None
+        self._new_ts = None
+        self.longpollserver_info = {}
+
+    def _await_socket_status(self, sock, type_, timeout=.0):
+        read_list = []
+        write_list = []
+
+        if type_ == 0:
+            read_list.append(sock)
+        elif type_ == 1:
+            write_list.append(sock)
+
+        r_l, w_l, _ = select.select(read_list, write_list, [], timeout)
+        if (type_ == 0 and sock in r_l) or (type_ == 1 and sock in w_l):
+            return sock
+
+        Util.Debug("the socket wasn't enabled on any list!")
+
+        return None
+
+    def _connect_longpoll(self):
+        if not self._sock:
+            Util.Debug("requesting info about the longpoll server")
+            self.longpollserver_info = plugin.GetLongPollServerInfo()
+            if not self.longpollserver_info:
+                return False
+
+            self.longpollserver_info["hostname"], self.longpollserver_info["path"] = self.longpollserver_info["server"].split("/", 1)
+
+            try:
+                Util.Debug("creating a socket for the longpoll connection")
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_IP)
+                Util.Debug("connecting to the longpoll server: {0}:80".format(self.longpollserver_info["hostname"]))
+                self._sock.connect((self.longpollserver_info["hostname"], 80))
+            except socket.error as e:
+                Util.Debug("unable to create socket for the longpoll server: {0}".format(e))
+                return False
+        elif self._new_ts:
+            Util.Debug("updating the ts field for a new future request")
+            self.longpollserver_info["ts"] = self._new_ts
+            self._new_ts = None
+        else:
+            Util.Debug("nothing to be done")
+            return True
+
+        sock = self._await_socket_status(self._sock, 1)
+        if sock:
+            http_request = "GET /{path}?act=a_check&key={key}&ts={ts}&wait=25&mode=2 HTTP/1.1{crlf}Host: {hostname}{crlf}{crlf}".format(
+                            path=self.longpollserver_info["path"], key=self.longpollserver_info["key"], ts=self.longpollserver_info["ts"],
+                            hostname=self.longpollserver_info["hostname"], crlf="\r\n")
+            try:
+                sock = self._await_socket_status(sock, 1)
+                if sock:
+                    Util.Debug("sending request (escaped): {0}".format(http_request.replace("\r\n", "\\r\\n")))
+                    sock.send(http_request)
+                else:
+                    return False
+            except socket.error as e:
+                Util.Debug("unable to send request to the longpoll server: {0}".format(e))
+                return False
+        else:
+            return False
+
+        return True
+
+    def GetUpdates(self):
+        updates = []
+
+        if not self._connect_longpoll():
+            return updates
+
+        data = ""
+        sock = self._await_socket_status(self._sock, 0, .1)
+        if sock:
+            while True:
+                sock = self._await_socket_status(sock, 0, .5)
+                if not sock:
+                    break
+
+                new_data = sock.recv(4096)
+                if not new_data:
+                    break
+                data += new_data
+
+            if not data:
+                Util.Debug("no data returned by the longpoll server")
+                return updates
+        else:
+            Util.Debug("socket to the longpoll server isn't readable, skipping")
+            return updates
+
+        Util.Debug(u"data received from the longpoll server: {0}".format(data.decode("utf-8", "ignore")))
+
+        header, body = data.split("\r\n\r\n", 1)
+        sheader =  header.split("\r\n")
+        status_line = sheader[0].split()
+        headers = dict(map(lambda x: tuple(x.split(": ", 1)), [ x for x in sheader[1:] if x ]))
+
+        if len(status_line) < 3 or status_line[1] != "200":
+            Util.Debug(u"error while received updates from the longpoll server: {0}".format(data.decode("utf-8", "ignore")))
+            return updates
+
+        body = body.decode("utf-8", "ignore")
+
+        try:
+            Util.Debug(u"deserializing data: {0}".format(body))
+            updates = json.loads(body)
+
+            if not "ts" in updates or not "updates" in updates:
+                Util.Debug(u"corrupted reply from the longpoll server: {0}".format(updates))
+                return []
+
+            self._new_ts = updates["ts"]
+            updates = updates["updates"]
+
+            Util.Debug(u"updates received: {0}".format(updates))
+
+        except ValueError as e:
+            Util.Debug(u"unable to deserialize the data: {0}".format(e))
+
+        ## If the answer from the server is { failed: 2 }, we need to request another key
+        ## After a while, the connection is reset by the server, so we have to make another request
+        if "failed" in updates or headers["Connection"] == "close":
+            self._sock.close()
+            self._sock = None
+            self._new_ts = None
+
+            return []
+
+        return updates
+
+updates_poller = UpdatesPoller()
+
 class BufferManager(object):
     FMT_BUFFER_NAME = u"{first_name} {last_name} ({nickname})"
+
+    def __init__(self):
+        super(BufferManager, self).__init__()
 
     def GetBuffer(self, buffer_id):
         assert(isinstance(buffer_id, unicode) or isinstance(buffer_id, str))
@@ -317,8 +495,6 @@ class BufferManager(object):
 
                 buffer_ = self.CreateChatBuffer(unicode(friend["id"]), friend["first_name"], friend["last_name"], friend["nickname"])
                 for message in messages:
-                    ## TODO: handle photos, emoticons and attachments
-
                     self.DisplayMessageBuffer(buffer_, message["date"], friend["first_name"], message["body"], False)
 
                 plugin.MarkMessagesAsRead([ message["id"] for message in messages ])
@@ -399,6 +575,7 @@ def CallbackBufferInput(_, buffer_, message):
     uid = weechat.buffer_get_string(buffer_, "localvar_uid")
     if uid:
         message = message.decode("utf-8")
+        ## TODO: make asynchronous
         if plugin.SendMessageUid(unicode(uid), message):
             buffer_manager.DisplayMessageBuffer(buffer_, int(time.time()), u"me", message, True)
 
@@ -480,24 +657,65 @@ def CallbackVkFetchFriends(_, __):
 
     return weechat.WEECHAT_RC_OK
 
-def CallbackVkFetchMessages(_, __):
+def CallbackVkFetchUpdates(_, __):
     if not plugin.IsAuthedVkontakte():
-        Util.Debug("unable to get unread messages: not authenticated")
+        Util.Debug("unable to get updates: not authenticated")
         return weechat.WEECHAT_RC_OK
 
-    ## FIXME: use polling
-    messages = plugin.GetUnreadMessages()
-    if messages:
-        buffer_manager.DisplayMessagesSortedUid(plugin.GetFriends(), messages)
+    updates = updates_poller.GetUpdates()
+    if not updates:
+        return weechat.WEECHAT_RC_OK
+
+    messages = []
+    for update in updates:
+        if not update or update[0] != 4:
+            continue
+
+        if len(update) < 8:
+            Util.Debug("message corrupted: {0}".format(update))
+            continue
+
+        if not (update[2] & VkMessageFlag.UNREAD) or not (update[2] & VkMessageFlag.FRIENDS) or (update[2] & VkMessageFlag.OUTBOX):
+            Util.Debug("message ignored: {0}".format(update))
+            continue
+
+        message = {
+            "id": update[1],
+            "user_id": update[3],
+            "date": update[4],
+            "body": update[6],
+        }
+
+        ## TODO: handle attachments and append as another message
+        # {"ts":1817952486,"updates":[[4,45316,563,11034418,1440257293," ... ","",{"attach1_type":"doc","attach1":"2000005557_413934409"}],[6,11034418,45315]]}
+        # {"ts":1817952488,"updates":[[4,45317,563,11034418,1440257358," ... ","",{"attach1_type":"photo","attach1":"185656651_374829480"}]
+        # {"ts":1817952538,"updates":[[4,45328,51,11034418,1440258883," ... ","😨",{"emoji":"1"}],[6,11034418,45327]]}
+        if update[7]:
+            pass
+
+        messages.append(message)
+
+    if not messages:
+        Util.Debug("the updates didn't contain any message")
+        return weechat.WEECHAT_RC_OK
+
+    friends = plugin.GetFriends()
+    if not friends:
+        ## FIXME: if no friends were added, it's possible to resolve the contact name by uid with an API call
+        Util.Debug("no friends in the list")
+        return weechat.WEECHAT_RC_OK
+
+    buffer_manager.DisplayMessagesSortedUid(friends, _sort_messages(messages))
+    plugin.MarkMessagesAsRead([ message["id"] for message in messages ])
 
     return weechat.WEECHAT_RC_OK
 
 def CallbackPluginUnloaded():
-    Util.Log("vk-chat unloaded")
+    Util.Log("plugin unloaded")
 
     plugin.UnregisterTimer("vk-auth")
-    plugin.UnregisterTimer("vk-fetch-friends")
-    plugin.UnregisterTimer("vk-fetch-messages")
+    ## plugin.UnregisterTimer("vk-fetch-friends")
+    plugin.UnregisterTimer("vk-fetch-updates")
 
     return weechat.WEECHAT_RC_OK
 
@@ -510,8 +728,9 @@ def main():
         plugin.SetCommands()
 
         plugin.RegisterTimer("vk-auth", 60 * 1000, 60, 0, "CallbackVkAuth", "")
-        plugin.RegisterTimer("vk-fetch-friends", 10 * 60 * 1000, 30, 0, "CallbackVkFetchFriends", "")
-        plugin.RegisterTimer("vk-fetch-messages", 30 * 1000, 1, 0, "CallbackVkFetchMessages", "")
+        ## TODO: look into how to make this callback co-exist with vk-fetch-updates
+        ## plugin.RegisterTimer("vk-fetch-friends", 10 * 60 * 1000, 30, 0, "CallbackVkFetchFriends", "")
+        plugin.RegisterTimer("vk-fetch-updates", 5 * 1000, 10, 0, "CallbackVkFetchUpdates", "")
 
         ## Do not wait for the timers to be triggered in 60s
         CallbackVkAuth(None, -1)
