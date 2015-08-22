@@ -258,6 +258,7 @@ class Plugin(object):
                 Util.SetConfigOption(k, v)
             else:
                 Util.Debug(u"option {0} is already set to '{1}'".format(k, option_value))
+                continue
 
     def SetCommands(self):
         weechat.hook_command("vkchat", "Chat with a friend on VK", "FIXME: document this command", "FIXME: document args", "FIXME: completion", "CallbackVkChat", "")
@@ -283,6 +284,7 @@ class Plugin(object):
             del self._timers[name]
         else:
             Util.Debug("timer '{0}' was never registered, skipping")
+            pass
 
 plugin = Plugin()
 
@@ -407,9 +409,9 @@ class UpdatesPoller(object):
             updates = updates["updates"]
 
             Util.Debug(u"updates received: {0}".format(updates))
-
         except ValueError as e:
             Util.Debug(u"unable to deserialize the data: {0}".format(e))
+            return []
 
         ## If the answer from the server is { failed: 2 }, we need to request another key
         ## After a while, the connection is reset by the server, so we have to make another request
